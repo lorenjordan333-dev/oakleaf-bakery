@@ -1,0 +1,117 @@
+name: DebuggerOS Runtime Sensor
+run-name: DebuggerOS Runtime Sensor @ ${{ inputs.sha || github.sha }}
+# debuggeros-workflow-version: v48-adaptive-sensors
+permissions:
+  contents: read
+  checks: read
+  actions: read
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit SHA to check (optional, defaults to workflow ref head)'
+        required: false
+        default: ''
+
+jobs:
+  runtime:
+    name: runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: deps-${{ runner.os }}-npm-${{ hashFiles('**/package.json', '**/bun.lock', '**/bun.lockb', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock') }}
+          restore-keys: |
+            deps-${{ runner.os }}-npm-
+      - name: Install dependencies
+        run: npm install
+      - name: Install Playwright (pinned) + Chromium browsers
+        shell: bash
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+        run: |
+          set -e
+          npm install --no-save playwright@1.47.0
+          npx playwright@1.47.0 install --with-deps chromium
+          echo "DEBUGGEROS_RUNTIME_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH"
+      - name: Start dev server and run runtime sensor
+        continue-on-error: true
+        shell: bash
+        env:
+          CI: 'true'
+          PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+        run: |
+          set +e
+          mkdir -p /tmp/debuggeros
+          if [ ! -f scripts/debuggeros-runtime.cjs ]; then
+            echo "===DEBUGGEROS_RUNTIME_BEGIN==="
+            echo '[{"type":"runtime-sensor-crash","text":"scripts/debuggeros-runtime.cjs missing - re-run Setup Build Check"}]'
+            echo "===DEBUGGEROS_RUNTIME_END==="
+            echo "DEBUGGEROS_RUNTIME_ERROR_COUNT=0"
+            exit 0
+          fi
+          echo "DEBUGGEROS_RUNTIME_NODE=$(node -v 2>&1 || echo missing)"
+          echo "DEBUGGEROS_RUNTIME_HAS_NODE_MODULES=$( [ -d node_modules ] && echo yes || echo no )"
+          echo "DEBUGGEROS_RUNTIME_HAS_VITE=$( [ -x node_modules/.bin/vite ] && echo yes || echo no )"
+          echo "DEBUGGEROS_RUNTIME_DEV_SCRIPT=$(node -e 'try{console.log(require("./package.json").scripts&&require("./package.json").scripts.dev||"missing")}catch(e){console.log("pkgerr:"+e.message)}' 2>&1)"
+          nohup npm run dev -- --host 0.0.0.0 --port 8080 > /tmp/debuggeros/dev.log 2>&1 &
+          DEV_PID=$!
+          echo "DEBUGGEROS_RUNTIME_DEV_PID=$DEV_PID"
+          APP_URL=""
+          POLL_LAST=""
+          for i in $(seq 1 60); do
+            sleep 2
+            if ! kill -0 "$DEV_PID" 2>/dev/null; then
+              POLL_LAST="dev-process-exited-at-iter-$i"
+              break
+            fi
+            READY_LINE=""
+            if [ -f /tmp/debuggeros/dev.log ]; then
+              READY_LINE=$(grep -E 'ready in|Local:[[:space:]]+http' /tmp/debuggeros/dev.log | head -n 1)
+            fi
+            CAND_PORTS="8080 5173 3000 4173"
+            LOG_URL=$(grep -Eo 'https?://(localhost|127.0.0.1|\[::1\]):[0-9]+' /tmp/debuggeros/dev.log 2>/dev/null | head -n 1)
+            if [ -n "$LOG_URL" ]; then
+              LOG_PORT=$(echo "$LOG_URL" | grep -Eo '[0-9]+$')
+              CAND_PORTS="$LOG_PORT $CAND_PORTS"
+            fi
+            for p in $CAND_PORTS; do
+              for host in 127.0.0.1 localhost; do
+                code=$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://$host:$p" 2>/dev/null || echo 000)
+                POLL_LAST="iter=$i host=$host port=$p code=$code"
+                if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ] || [ "$code" = "304" ]; then
+                  APP_URL="http://$host:$p"
+                  break 3
+                fi
+              done
+            done
+          done
+          echo "DEBUGGEROS_RUNTIME_POLL_LAST=$POLL_LAST"
+          echo "DEBUGGEROS_RUNTIME_APP_URL=${APP_URL:-none}"
+          echo "===DEBUGGEROS_RUNTIME_DEVLOG_BEGIN==="
+          head -n 80 /tmp/debuggeros/dev.log 2>/dev/null || echo "(no dev.log)"
+          echo "===DEBUGGEROS_RUNTIME_DEVLOG_END==="
+          if [ -z "$APP_URL" ]; then
+            REASON="dev server did not become ready within 120s ($POLL_LAST)"
+            echo "===DEBUGGEROS_RUNTIME_BEGIN==="
+            printf '[{"type":"navigation-failure","text":%s}]\n' "$(printf '%s' "$REASON" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>process.stdout.write(JSON.stringify(d)))')"
+            echo "===DEBUGGEROS_RUNTIME_END==="
+            echo "DEBUGGEROS_RUNTIME_ERROR_COUNT=0"
+            kill "$DEV_PID" 2>/dev/null || true
+            exit 0
+          fi
+          APP_URL="$APP_URL" PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" node scripts/debuggeros-runtime.cjs
+          kill "$DEV_PID" 2>/dev/null || true
+          exit 0
