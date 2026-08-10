@@ -1,0 +1,121 @@
+name: DebuggerOS Build Check
+run-name: DebuggerOS Build Check @ ${{ github.sha }}
+# debuggeros-workflow-version: v48-adaptive-sensors
+# debuggeros-build-config: pm=npm node=20 bun=false pnpm=false build_script=true
+permissions:
+  contents: read
+  checks: read
+  actions: read
+on:
+  push:
+  workflow_dispatch:
+
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: deps-${{ runner.os }}-npm-${{ hashFiles('**/package.json', '**/bun.lock', '**/bun.lockb', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock') }}
+          restore-keys: |
+            deps-${{ runner.os }}-npm-
+      - name: Install dependencies
+        run: npm install
+      - name: Build
+        run: npm run build
+
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: deps-${{ runner.os }}-npm-${{ hashFiles('**/package.json', '**/bun.lock', '**/bun.lockb', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock') }}
+          restore-keys: |
+            deps-${{ runner.os }}-npm-
+      - name: Install dependencies
+        run: npm install
+      - name: Run tsc (diagnostic, non-blocking)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          echo "===DEBUGGEROS_TSC_BEGIN==="
+          TSC_CONFIG=tsconfig.json
+          if [ -f tsconfig.app.json ]; then
+            TSC_CONFIG=tsconfig.app.json
+          else
+            for cfg in tsconfig.*.json; do
+              [ -f "$cfg" ] || continue
+              if grep -q '"include"' "$cfg" && grep -q 'src' "$cfg"; then
+                TSC_CONFIG="$cfg"
+                break
+              fi
+            done
+          fi
+          echo "DEBUGGEROS_TSC_PLAN=$TSC_CONFIG"
+          npx --yes tsc --noEmit -p "$TSC_CONFIG"
+          TSC_EXIT=$?
+          echo "DEBUGGEROS_TSC_EXIT=$TSC_EXIT"
+          echo "===DEBUGGEROS_TSC_END==="
+          exit 0
+
+  eslint:
+    name: eslint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: deps-${{ runner.os }}-npm-${{ hashFiles('**/package.json', '**/bun.lock', '**/bun.lockb', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock') }}
+          restore-keys: |
+            deps-${{ runner.os }}-npm-
+      - name: Install dependencies
+        run: npm install
+      - name: Run DebuggerOS ESLint sensor (react-hooks, non-blocking)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          if [ ! -f scripts/debuggeros-eslint.cjs ]; then
+            echo "===DEBUGGEROS_ESLINT_BEGIN==="
+            echo "[]"
+            echo "===DEBUGGEROS_ESLINT_END==="
+            echo "DEBUGGEROS_ESLINT_EXIT=0"
+            echo "DEBUGGEROS_ESLINT_SKIPPED=script-missing"
+            exit 0
+          fi
+          node scripts/debuggeros-eslint.cjs
+          exit 0
+
+
