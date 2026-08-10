@@ -24,7 +24,9 @@ jobs:
           node-version: 20
       - run: npm install
       - run: npm run build
-      - uses: actions/configure-pages@v5
+      # No configure-pages step: the base path is hardcoded in vite.config.js, and the
+      # step fails outright if Pages has not been enabled yet, which is a chicken-and-egg
+      # problem on a brand new repository.
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
