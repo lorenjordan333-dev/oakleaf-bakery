@@ -1,0 +1,123 @@
+name: DebuggerOS Visual Sensor
+run-name: DebuggerOS Visual Sensor @ ${{ inputs.run_id }} ${{ inputs.page_path }}
+# debuggeros-workflow-version: v48-adaptive-sensors
+permissions:
+  contents: read
+  actions: read
+on:
+  workflow_dispatch:
+    inputs:
+      page_path:
+        description: 'Path to screenshot (e.g. /, /activity)'
+        required: false
+        default: '/'
+      run_id:
+        description: 'DebuggerOS correlation id'
+        required: false
+        default: ''
+
+jobs:
+
+  visual:
+    name: visual
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: deps-${{ runner.os }}-npm-${{ hashFiles('**/package.json', '**/bun.lock', '**/bun.lockb', '**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock') }}
+          restore-keys: |
+            deps-${{ runner.os }}-npm-
+      - name: Install dependencies
+        run: npm install
+      - name: Install Playwright + Chromium
+        shell: bash
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+        run: |
+          set -e
+          npm install --no-save playwright@1.47.0
+          npx playwright@1.47.0 install --with-deps chromium
+      - name: Start dev server and screenshot page
+        continue-on-error: true
+        shell: bash
+        env:
+          CI: 'true'
+          NO_COLOR: '1'
+          FORCE_COLOR: '0'
+          TERM: 'dumb'
+          PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+          PAGE_PATH: ${{ inputs.page_path }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set +e
+          # Strip ANSI color escape sequences (SGR only — simple, safe regex).
+          strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
+          mkdir -p /tmp/debuggeros
+          echo "DEBUGGEROS_VISUAL_SCRIPT_PATH=scripts/debuggeros-visual.cjs"
+          echo "DEBUGGEROS_VISUAL_SCRIPT_PRESENT=$( [ -f scripts/debuggeros-visual.cjs ] && echo yes || echo no )"
+          NODE_VER=$(node -v 2>&1 || echo missing)
+          HAS_NM=$( [ -d node_modules ] && echo yes || echo no )
+          DEV_SCRIPT=$(node -e 'try{console.log(require("./package.json").scripts&&require("./package.json").scripts.dev||"missing")}catch(e){console.log("pkgerr:"+e.message)}' 2>&1)
+          echo "DEBUGGEROS_VISUAL_NODE=$NODE_VER"
+          echo "DEBUGGEROS_VISUAL_HAS_NODE_MODULES=$HAS_NM"
+          echo "DEBUGGEROS_VISUAL_DEV_SCRIPT=$DEV_SCRIPT"
+          nohup npm run dev -- --host 0.0.0.0 --port 8080 > /tmp/debuggeros/dev.log 2>&1 &
+          DEV_PID=$!
+          echo "DEBUGGEROS_VISUAL_DEV_PID=$DEV_PID"
+          APP_URL=""
+          POLL_LAST="no-iterations"
+          for i in $(seq 1 60); do
+            sleep 2
+            if ! kill -0 "$DEV_PID" 2>/dev/null; then
+              POLL_LAST="dev-process-exited-at-iter-$i"
+              break
+            fi
+            CAND_PORTS="8080 5173 3000 4173"
+            for p in $CAND_PORTS; do
+              for host in 127.0.0.1 localhost; do
+                code=$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://$host:$p" 2>/dev/null || echo 000)
+                POLL_LAST="iter=$i host=$host port=$p code=$code"
+                if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ] || [ "$code" = "304" ]; then
+                  APP_URL="http://$host:$p"
+                  break 3
+                fi
+              done
+            done
+          done
+          # Trim whitespace/quotes/ANSI leftovers defensively.
+          APP_URL=$(printf '%s' "$APP_URL" | strip_ansi | tr -d '"\r\n' | xargs)
+          export APP_URL
+          export POLL_LAST
+          printf 'DEBUGGEROS_VISUAL_POLL_LAST=%s\n' "$POLL_LAST"
+          printf 'DEBUGGEROS_VISUAL_APP_URL=%s\n' "$APP_URL"
+          printf 'APP_URL=%s\n' "$APP_URL" >> "$GITHUB_ENV"
+          printf 'POLL_LAST=%s\n' "$POLL_LAST" >> "$GITHUB_ENV"
+          echo "===DEBUGGEROS_VISUAL_DEVLOG_BEGIN==="
+          (head -n 80 /tmp/debuggeros/dev.log 2>/dev/null || echo "(no dev.log)") | strip_ansi
+          echo "===DEBUGGEROS_VISUAL_DEVLOG_END==="
+          case "$APP_URL" in
+            http*) : ;;
+            *)
+              echo "DEBUGGEROS_VISUAL_SKIPPED=dev-not-ready"
+              echo "===DEBUGGEROS_VISUAL_BEGIN==="
+              echo ""
+              echo "===DEBUGGEROS_VISUAL_END==="
+              kill "$DEV_PID" 2>/dev/null || true
+              exit 0
+              ;;
+          esac
+
+          echo "DEBUGGEROS_VISUAL_EXEC=node scripts/debuggeros-visual.cjs"
+          node scripts/debuggeros-visual.cjs 2>&1 | strip_ansi
+          kill "$DEV_PID" 2>/dev/null || true
+          exit 0
